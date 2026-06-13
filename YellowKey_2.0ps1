@@ -1,0 +1,219 @@
+<#
+.SYNOPSIS
+    Advanced DFIR Threat Hunting script for YellowKey TxF-based WinRE/BitLocker bypass.
+.DESCRIPTION
+    High-performance, enterprise-grade forensic scanner that detects IoCs associated 
+    with YellowKey manipulation of the Transactional NTFS (TxF) and Common Log File System (CLFS).
+.OUTPUTS
+    [PSCustomObject] - Collection of detected indicators with high fidelity.
+#>
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+# ---------------------------------------------------------------------------
+# [ELITE CONFIGURATION & CONSTANTS]
+# ---------------------------------------------------------------------------
+$IOC_TXN_GUID        = "95F62703B343F111A92A005056975458"
+$IOC_TEMP_FILE_GUID  = "98F62703B343F111A92A005056975458"
+$IOC_KTM_GUIDS       = [System.Collections.Generic.HashSet[string]]::new([string[]]@(
+    "352AAA60-43A1-11F1-A92A-005056975458",
+    "352AAA62-43A1-11F1-A92A-005056975458",
+    "352AAA63-43A1-11F1-A92A-005056975458"
+), [System.StringComparer]::OrdinalIgnoreCase)
+
+# CLFS Magic: Signature, Version 2.2, and specific CRC32
+$CLFS_MAGIC = [byte[]](
+    0x15, 0x00, 0x01, 0x00, 
+    0x02, 0x00, 0x02, 0x00, 
+    0x00, 0x00, 0x00, 0x00, 
+    0x4B, 0x82, 0x4C, 0xC6
+)
+$WINPESHL_UTF16 = [System.Text.Encoding]::Unicode.GetBytes("\??\X:\Windows\System32\winpeshl.ini")
+
+$EXPECTED_FSTX_FILES = [System.Collections.Generic.Dictionary[string, [long]]]::new([System.StringComparer]::OrdinalIgnoreCase)
+$EXPECTED_FSTX_FILES.Add("FsTxLog.blf", 65536)
+$EXPECTED_FSTX_FILES.Add("FsTxKtmLog.blf", 65536)
+$EXPECTED_FSTX_FILES.Add("FsTxLogContainer00000000000000000001", 10485760)
+$EXPECTED_FSTX_FILES.Add("FsTxLogContainer00000000000000000002", 10485760)
+$EXPECTED_FSTX_FILES.Add("FsTxKtmLogContainer00000000000000000001", 524288)
+$EXPECTED_FSTX_FILES.Add("FsTxKtmLogContainer00000000000000000002", 524288)
+
+# ---------------------------------------------------------------------------
+# [WIN32 API & PRIVILEGE ELEVATION]
+# ---------------------------------------------------------------------------
+# Permite al script saltarse ACLs restrictivas usando privilegios nativos de Backup/Restore
+Class Win32Privileges {
+    [void] static SetBackupPrivilege() {
+        $TypeDefinition = @'
+        using System;
+        using System.Runtime.InteropServices;
+        public class TokenPrivilege {
+            [DllImport("advapi32.dll", SetLastError = true)]
+            public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+            [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Auto)]
+            public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out long lpLuid);
+            [DllImport("advapi32.dll", SetLastError = true)]
+            public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+            
+            [StructLayout(LayoutKind.Sequential)]
+            public struct TOKEN_PRIVILEGES {
+                public uint PrivilegeCount;
+                public long Luid;
+                public uint Attributes;
+            }
+        }
+'@
+        Add-Type -TypeDefinition $TypeDefinition -ErrorAction SilentlyContinue
+        $handle = [System.Diagnostics.Process]::GetCurrentProcess().Handle
+        $token  = [IntPtr]::Zero
+        if ([TokenPrivilege]::OpenProcessToken($handle, 0x0020 -or 0x0008, [ref]$token)) {
+            $luid = [long]0
+            if ([TokenPrivilege]::LookupPrivilegeValue($null, "SeBackupPrivilege", [ref]$luid)) {
+                $tp = New-Object TokenPrivilege+TOKEN_PRIVILEGES
+                $tp.PrivilegeCount = 1
+                $tp.Luid = $luid
+                $tp.Attributes = 0x00000002 # SE_PRIVILEGE_ENABLED
+                [TokenPrivilege]::AdjustTokenPrivileges($token, $false, [ref]$tp, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+            }
+        }
+    }
+}
+[Win32Privileges]::SetBackupPrivilege()
+
+# ---------------------------------------------------------------------------
+# [HIGH PERFORMANCE HELPERS]
+# ---------------------------------------------------------------------------
+function Test-BytesAtOffset {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][byte[]]$Pattern,
+        [long]$Offset = 0
+    )
+    if (-not [System.IO.File]::Exists($FilePath)) { return $false }
+    $fs = $null
+    try {
+        # FileShare.ReadWrite previene bloqueos si el archivo está siendo usado
+        $fs = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt ($Offset + $Pattern.Length)) { return $false }
+        $null = $fs.Seek($Offset, [System.IO.SeekOrigin]::Begin)
+        
+        $buffer = New-Object byte[] $Pattern.Length
+        $bytesRead = $fs.Read($buffer, 0, $Pattern.Length)
+        if ($bytesRead -ne $Pattern.Length) { return $false }
+
+        for ($i = 0; $i -lt $Pattern.Length; $i++) {
+            if ($buffer[$i] -ne $Pattern[$i]) { return $false }
+        }
+        return $true
+    }
+    catch { return $false }
+    finally { if ($fs) { $fs.Close(); $fs.Dispose() } }
+}
+
+function Search-BytesStreaming {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][byte[]]$Pattern
+    )
+    if (-not [System.IO.File]::Exists($FilePath)) { return $false }
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($FilePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $bufferSize = 4096
+        $buffer = New-Object byte[] $bufferSize
+        $patternLength = $Pattern.Length
+        $overlap = $patternLength - 1
+        $bytesRead = 0
+        $position = 0
+
+        while (($bytesRead = $fs.Read($buffer, 0, $bufferSize)) -gt 0) {
+            for ($i = 0; $i -le ($bytesRead - $patternLength); $i++) {
+                $match = $true
+                for ($j = 0; $j -lt $patternLength; $j++) {
+                    if ($buffer[$i + $j] -ne $Pattern[$j]) { $match = $false; break }
+                }
+                if ($match) { return $true }
+            }
+            if ($fs.Position -eq $fs.Length) { break }
+            # Manejo del solapamiento del búfer (Edge Case)
+            $null = $fs.Seek(-$overlap, [System.IO.SeekOrigin]::Current)
+        }
+        return $false
+    }
+    catch { return $false }
+    finally { if ($fs) { $fs.Close(); $fs.Dispose() } }
+}
+
+function New-Detection {
+    param([string]$Category, [string]$Detail, [string]$Path)
+    [PSCustomObject]@{
+        Timestamp   = [System.DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+        ComputerName= $env:COMPUTERNAME
+        Category    = $Category
+        Detail      = $Detail
+        Path        = $Path
+        Severity    = "CRITICAL"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# [MAIN SCANNERS ENGINE]
+# ---------------------------------------------------------------------------
+$Results = [System.Collections.Generic.List[PSCustomObject]]::new()
+$Drives  = [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq 'Fixed' }
+
+# --- CHECK 1: FileSystem Forensic Walk ---
+foreach ($drive in $Drives) {
+    $root = $drive.Name
+    $sviPath = [System.IO.Path]::Combine($root, "System Volume Information\FsTx")
+    if (-not [System.IO.Directory]::Exists($sviPath)) { continue }
+
+    try {
+        $subDirs = [System.IO.Directory]::GetDirectories($sviPath)
+        foreach ($dir in $subDirs) {
+            $dirName = [System.IO.Path]::GetFileName($dir)
+            if ($dirName -ne $IOC_TXN_GUID) {
+                $Results.Add((New-Detection "FsTx Dir (Anomalous GUID)" "Unexpected transactional GUID format discovered." $dir))
+            }
+        }
+    } catch {}
+
+    $fstxBase = [System.IO.Path]::Combine($sviPath, $IOC_TXN_GUID)
+    if ([System.IO.Directory]::Exists($fstxBase)) {
+        $Results.Add((New-Detection "FsTx Base Directory" "Known YellowKey operational GUID present." $fstxBase))
+        
+        $logsDir = [System.IO.Path]::Combine($fstxBase, "FsTxLogs")
+        if ([System.IO.Directory]::Exists($logsDir)) {
+            foreach ($kv in $EXPECTED_FSTX_FILES.GetEnumerator()) {
+                $filePath = [System.IO.Path]::Combine($logsDir, $kv.Key)
+                if (-not [System.IO.File]::Exists($filePath)) { continue }
+
+                $fileInfo = New-Object System.IO.FileInfo($filePath)
+                $sizeMatch = ($fileInfo.Length -eq $kv.Value)
+                
+                $Results.Add((New-Detection "FsTx Exploit File" "Artifact file found. ExpectedSize=$($kv.Value), ActualSize=$($fileInfo.Length), SizeMatch=$sizeMatch" $filePath))
+
+                if ($kv.Key.EndsWith(".blf", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    if (Test-BytesAtOffset -FilePath $filePath -Pattern $CLFS_MAGIC -Offset 0) {
+                        $Results.Add((New-Detection "CLFS Corrupted Signature" "Hardcoded CRC32 and Magic Bytes detected in BLF header." $filePath))
+                    }
+                }
+
+                if ($kv.Key.StartsWith("FsTxLogContainer", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    if (Search-BytesStreaming -FilePath $filePath -Pattern $WINPESHL_UTF16) {
+                        $Results.Add((New-Detection "Embedded Malicious Payload Path" "Found Hardcoded UTF-16 winpeshl.ini reference inside CLFS container." $filePath))
+                    }
+                }
+            }
+        }
+
+        $tempFile = [System.IO.Path]::Combine($fstxBase, "FsTxTemp", $IOC_TEMP_FILE_GUID)
+        if ([System.IO.File]::Exists($tempFile)) {
+            $Results.Add((New-Detection "FsTx Temp Marker" "Zero-byte structural payload marker detected." $tempFile))
+        }
+    }
+}
+
