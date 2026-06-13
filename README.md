@@ -1,4 +1,4 @@
-# README.md — YellowKey 2.0
+#  YellowKey 2.0
 
 ## Vulnerabilidad de Omisión de BitLocker en Windows 11/Server 2022-2025
 
